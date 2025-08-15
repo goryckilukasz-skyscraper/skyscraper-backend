@@ -6,7 +6,10 @@ echo "📦 Installing Python dependencies..."
 pip install --upgrade pip
 pip install --no-cache-dir -r requirements.txt
 
-echo "🎭 Installing Playwright and Chromium..."
-playwright install --with-deps chromium
+echo "🎭 Installing Playwright (lightweight)..."
+# Install playwright first
+playwright install-deps
+# Then install only chromium (smaller footprint)
+playwright install chromium
 
 echo "✅ Build completed successfully!"
