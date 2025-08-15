@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: skyscraper-bot-api
+    env: python
+    region: oregon
+    plan: starter
+    buildCommand: "chmod +x build.sh && ./build.sh"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT --workers 4"
+    repo: https://github.com/goryckikukasz-skyscraper/skyscraper-backend
+    branch: main
+    healthCheckPath: /v1/health
+    autoDeploy: true
+
+  - type: redis
+    name: skyscraper-redis
+    region: oregon
+    plan: starter
+
+databases:
+  - name: skyscraper-db
+    region: oregon
+    plan: starter
+    databaseName: skyscraper_prod
+    user: skyscraper_user
