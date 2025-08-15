@@ -4,7 +4,7 @@ services:
     env: python
     region: oregon
     plan: starter
-    buildCommand: "chmod +x build.sh && ./build.sh"
+    buildCommand: "pip install fastapi uvicorn httpx pydantic requests pandas openai anthropic python-dotenv cryptography python-json-logger click gunicorn"
     startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT --workers 4"
     repo: https://github.com/goryckikukasz-skyscraper/skyscraper-backend
     branch: main
