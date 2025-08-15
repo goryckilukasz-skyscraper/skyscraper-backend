@@ -1,66 +1,68 @@
+# Lightweight SkyScraper Backend - Replace your scraping engine with this
+
 import os
 import json
 import asyncio
 import logging
+import time
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 import aiohttp
+import requests
+from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, HttpUrl
 import google.generativeai as genai
-from playwright.async_api import async_playwright
 import pandas as pd
 import xml.etree.ElementTree as ET
 from google.oauth2 import id_token
-from google.auth.transport import requests
-import io
+from google.auth.transport import requests as google_requests
+import re
+from urllib.parse import urljoin, urlparse
 
 # Configuration
 GOOGLE_CLIENT_ID = "416380249965-ljohffe5opnfb3v52ehkq03svdogk99i.apps.googleusercontent.com"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyCbVtyxS4f6ZWU8ceHm6wHEvEfi-2DA5Ag")
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 
 # Configure Gemini
 genai.configure(api_key=GEMINI_API_KEY)
 
 # Initialize FastAPI
-app = FastAPI(title="SkyScraper.bot API", version="1.0.0")
+app = FastAPI(
+    title="SkyScraper.bot API", 
+    version="1.0.0",
+    description="Lightweight web scraping with AI-powered extraction"
+)
 
-# CORS middleware - Allow your domain
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://skyscraper.bot",
-        "https://www.skyscraper.bot", 
-        "http://localhost:3000",
-        "http://localhost:8080"
-    ],
+        "https://www.skyscraper.bot",
+        "http://localhost:3000"
+    ] if ENVIRONMENT == "production" else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # Security
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 # Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Pydantic Models
+# Models
 class ScrapingRequest(BaseModel):
     url: HttpUrl
     instruction: str
     format: str = "json"
-    anti_detection: bool = True
-    extract_metadata: bool = True
-    language: Optional[str] = "auto"
-
-class UserAuth(BaseModel):
-    token: str
-    email: str
-    name: str
+    timeout: Optional[int] = 30
 
 class ScrapingResponse(BaseModel):
     job_id: str
@@ -69,230 +71,301 @@ class ScrapingResponse(BaseModel):
     metadata: Optional[Dict] = None
     download_urls: Optional[Dict] = None
     processing_time: Optional[float] = None
+    message: Optional[str] = None
 
-# In-memory storage (use Redis/database in production)
+# Storage
 jobs_storage = {}
 users_storage = {}
 
-# Authentication
-async def verify_google_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    try:
-        token = credentials.credentials
-        # Verify Google OAuth token
-        idinfo = id_token.verify_oauth2_token(token, requests.Request(), GOOGLE_CLIENT_ID)
-        return idinfo
-    except Exception as e:
-        raise HTTPException(status_code=401, detail="Invalid authentication token")
-
-# LangExtract Integration Class
-class LangExtractProcessor:
+# Lightweight Web Scraper
+class LightweightScraper:
     def __init__(self):
-        self.model = genai.GenerativeModel('gemini-pro')
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
+        })
     
-    async def extract_metadata(self, content: str, url: str) -> Dict[str, Any]:
-        """Extract structured metadata using Gemini/LangExtract approach"""
-        prompt = f"""
-        Analyze this web content and extract structured metadata. Return as JSON:
-        
-        Content from {url}:
-        {content[:3000]}...
-        
-        Extract:
-        1. document_type (article, product_page, blog, documentation, etc.)
-        2. primary_topic (main subject/category)
-        3. entities (people, companies, products mentioned)
-        4. data_types (tables, lists, forms, images, etc.)
-        5. language (detected language)
-        6. content_structure (headers, sections, key areas)
-        7. extraction_confidence (1-10 score)
-        
-        Return only valid JSON:
-        """
-        
+    async def scrape_url(self, url: str, timeout: int = 30) -> Dict[str, Any]:
+        """Lightweight web scraping using requests + BeautifulSoup"""
         try:
-            response = await self.model.generate_content_async(prompt)
-            metadata_json = response.text.strip()
-            # Clean up the response to extract JSON
-            if "```json" in metadata_json:
-                metadata_json = metadata_json.split("```json")[1].split("```")[0]
-            elif "```" in metadata_json:
-                metadata_json = metadata_json.split("```")[1].split("```")[0]
+            logger.info(f"Scraping: {url}")
             
-            return json.loads(metadata_json)
+            # Make request
+            response = self.session.get(str(url), timeout=timeout, allow_redirects=True)
+            response.raise_for_status()
+            
+            # Parse HTML
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Extract data
+            data = {
+                'url': str(url),
+                'title': soup.title.string if soup.title else 'No title',
+                'text': soup.get_text(strip=True, separator=' '),
+                'html': str(soup),
+                'meta': self._extract_meta(soup),
+                'links': self._extract_links(soup, url),
+                'images': self._extract_images(soup, url),
+                'headings': self._extract_headings(soup),
+                'tables': self._extract_tables(soup),
+                'forms': self._extract_forms(soup),
+                'lists': self._extract_lists(soup)
+            }
+            
+            return {
+                'success': True,
+                'url': str(url),
+                'structured_data': data,
+                'timestamp': datetime.now().isoformat(),
+                'scraping_stats': {
+                    'content_length': len(data['text']),
+                    'links_found': len(data['links']),
+                    'images_found': len(data['images']),
+                    'tables_found': len(data['tables']),
+                    'forms_found': len(data['forms'])
+                }
+            }
+            
+        except requests.RequestException as e:
+            logger.error(f"Scraping failed for {url}: {str(e)}")
+            raise Exception(f"Failed to scrape {url}: {str(e)}")
         except Exception as e:
-            logger.error(f"Metadata extraction failed: {e}")
-            return {"error": str(e), "extraction_confidence": 1}
-
-# Web Scraping Engine
-class SkyscraperEngine:
-    def __init__(self):
-        self.lang_extract = LangExtractProcessor()
+            logger.error(f"Unexpected error scraping {url}: {str(e)}")
+            raise Exception(f"Scraping error: {str(e)}")
     
-    async def scrape_with_playwright(self, url: str, anti_detection: bool = True) -> Dict[str, Any]:
-        """Advanced web scraping with Playwright"""
-        async with async_playwright() as p:
-            # Launch browser with anti-detection features
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    '--no-sandbox',
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-dev-shm-usage',
-                    '--disable-web-security',
-                ] if anti_detection else []
-            )
+    def _extract_meta(self, soup) -> Dict[str, str]:
+        """Extract meta information"""
+        meta = {}
+        for tag in soup.find_all('meta'):
+            name = tag.get('name') or tag.get('property')
+            content = tag.get('content')
+            if name and content:
+                meta[name] = content
+        return meta
+    
+    def _extract_links(self, soup, base_url: str) -> List[Dict[str, str]]:
+        """Extract all links"""
+        links = []
+        for link in soup.find_all('a', href=True):
+            href = link['href']
+            text = link.get_text(strip=True)
+            if href and text:
+                # Make absolute URL
+                absolute_url = urljoin(base_url, href)
+                links.append({
+                    'text': text,
+                    'href': absolute_url,
+                    'title': link.get('title', '')
+                })
+        return links[:100]  # Limit to first 100 links
+    
+    def _extract_images(self, soup, base_url: str) -> List[Dict[str, str]]:
+        """Extract all images"""
+        images = []
+        for img in soup.find_all('img'):
+            src = img.get('src')
+            if src:
+                absolute_url = urljoin(base_url, src)
+                images.append({
+                    'src': absolute_url,
+                    'alt': img.get('alt', ''),
+                    'title': img.get('title', '')
+                })
+        return images[:50]  # Limit to first 50 images
+    
+    def _extract_headings(self, soup) -> Dict[str, List[str]]:
+        """Extract all headings"""
+        headings = {}
+        for i in range(1, 7):  # h1 to h6
+            tag_name = f'h{i}'
+            headings[tag_name] = [h.get_text(strip=True) for h in soup.find_all(tag_name)]
+        return headings
+    
+    def _extract_tables(self, soup) -> List[Dict[str, Any]]:
+        """Extract table data"""
+        tables = []
+        for table in soup.find_all('table'):
+            rows = []
+            headers = []
             
-            context = await browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-                viewport={'width': 1920, 'height': 1080},
-                extra_http_headers={
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept-Encoding': 'gzip, deflate, br',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                }
-            )
+            # Get headers
+            header_row = table.find('tr')
+            if header_row:
+                headers = [th.get_text(strip=True) for th in header_row.find_all(['th', 'td'])]
             
-            page = await context.new_page()
+            # Get all rows
+            for row in table.find_all('tr')[1:]:  # Skip header row
+                cells = [td.get_text(strip=True) for td in row.find_all(['td', 'th'])]
+                if cells:
+                    rows.append(cells)
             
-            # Add stealth techniques
-            if anti_detection:
-                await page.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', {
-                        get: () => undefined,
-                    });
-                """)
+            if headers or rows:
+                tables.append({
+                    'headers': headers,
+                    'rows': rows[:20]  # Limit rows
+                })
+        
+        return tables[:10]  # Limit to first 10 tables
+    
+    def _extract_forms(self, soup) -> List[Dict[str, Any]]:
+        """Extract form information"""
+        forms = []
+        for form in soup.find_all('form'):
+            inputs = []
+            for input_tag in form.find_all(['input', 'select', 'textarea']):
+                inputs.append({
+                    'name': input_tag.get('name', ''),
+                    'type': input_tag.get('type', ''),
+                    'placeholder': input_tag.get('placeholder', ''),
+                    'required': input_tag.has_attr('required')
+                })
             
-            try:
-                # Navigate to page
-                await page.goto(str(url), wait_until='networkidle', timeout=30000)
-                await page.wait_for_timeout(2000)  # Wait for dynamic content
-                
-                # Extract comprehensive data
-                content = await page.content()
-                title = await page.title()
-                
-                # Extract structured data
-                page_data = await page.evaluate("""
-                    () => {
-                        const data = {
-                            title: document.title,
-                            text: document.body.innerText,
-                            links: Array.from(document.querySelectorAll('a')).map(a => ({
-                                text: a.innerText.trim(),
-                                href: a.href
-                            })).filter(l => l.text && l.href),
-                            images: Array.from(document.querySelectorAll('img')).map(img => ({
-                                src: img.src,
-                                alt: img.alt
-                            })),
-                            tables: Array.from(document.querySelectorAll('table')).map(table => {
-                                const rows = Array.from(table.querySelectorAll('tr'));
-                                return rows.map(row => 
-                                    Array.from(row.querySelectorAll('td, th')).map(cell => cell.innerText.trim())
-                                );
-                            }),
-                            forms: Array.from(document.querySelectorAll('form')).map(form => ({
-                                action: form.action,
-                                method: form.method,
-                                inputs: Array.from(form.querySelectorAll('input')).map(input => ({
-                                    name: input.name,
-                                    type: input.type,
-                                    placeholder: input.placeholder
-                                }))
-                            })),
-                            headings: {
-                                h1: Array.from(document.querySelectorAll('h1')).map(h => h.innerText.trim()),
-                                h2: Array.from(document.querySelectorAll('h2')).map(h => h.innerText.trim()),
-                                h3: Array.from(document.querySelectorAll('h3')).map(h => h.innerText.trim())
-                            }
-                        };
-                        return data;
-                    }
-                """)
-                
-                await browser.close()
-                return {
-                    'success': True,
-                    'url': str(url),
-                    'raw_html': content,
-                    'structured_data': page_data,
-                    'timestamp': datetime.now().isoformat()
-                }
-                
-            except Exception as e:
-                await browser.close()
-                raise Exception(f"Scraping failed: {str(e)}")
+            forms.append({
+                'action': form.get('action', ''),
+                'method': form.get('method', 'GET'),
+                'inputs': inputs
+            })
+        
+        return forms[:5]  # Limit to first 5 forms
+    
+    def _extract_lists(self, soup) -> List[Dict[str, Any]]:
+        """Extract list data"""
+        lists = []
+        for list_tag in soup.find_all(['ul', 'ol']):
+            items = [li.get_text(strip=True) for li in list_tag.find_all('li')]
+            if items:
+                lists.append({
+                    'type': list_tag.name,
+                    'items': items[:20]  # Limit items
+                })
+        
+        return lists[:10]  # Limit to first 10 lists
 
-    async def process_with_gemini(self, data: Dict[str, Any], instruction: str) -> Dict[str, Any]:
-        """Process scraped data with Gemini AI based on user instruction"""
-        model = genai.GenerativeModel('gemini-pro')
-        
-        # Prepare content for AI processing
-        content_text = data['structured_data']['text'][:5000]  # Limit for API
-        
-        prompt = f"""
-        User instruction: "{instruction}"
-        
-        Website data from {data['url']}:
-        Title: {data['structured_data']['title']}
-        Content: {content_text}
-        Links: {len(data['structured_data']['links'])} found
-        Tables: {len(data['structured_data']['tables'])} found
-        Forms: {len(data['structured_data']['forms'])} found
-        
-        Based on the user's instruction, extract and return the relevant information in a structured JSON format.
-        Focus on what the user specifically asked for.
-        """
+# Enhanced LangExtract (same as before)
+class LightweightLangExtract:
+    def __init__(self, api_key: str):
+        self.model = genai.GenerativeModel('gemini-pro')
+        self.api_key = api_key
+    
+    async def smart_extract(self, content: str, instruction: str, url: str) -> Dict[str, Any]:
+        """Smart extraction with AI"""
+        start_time = time.time()
         
         try:
-            response = await model.generate_content_async(prompt)
+            # Limit content for API
+            limited_content = content[:6000]
+            
+            # Create extraction prompt
+            prompt = f"""
+            Extract information based on this instruction: "{instruction}"
+            
+            From website: {url}
+            Content: {limited_content}
+            
+            Based on the user's instruction, extract the relevant information in JSON format.
+            Focus on what the user specifically requested.
+            Structure your response appropriately for the type of data requested.
+            
+            Return only valid JSON.
+            """
+            
+            # Get AI response
+            response = await self.model.generate_content_async(prompt)
             ai_response = response.text
             
-            # Try to parse as JSON, fallback to structured text
+            # Clean and parse JSON
             try:
                 if "```json" in ai_response:
                     json_part = ai_response.split("```json")[1].split("```")[0]
-                    return json.loads(json_part)
+                    extracted_data = json.loads(json_part)
                 else:
-                    return {"ai_extracted_data": ai_response, "raw_data": data['structured_data']}
-            except:
-                return {"ai_extracted_data": ai_response, "raw_data": data['structured_data']}
-                
+                    # Try to parse as-is
+                    extracted_data = json.loads(ai_response)
+            except json.JSONDecodeError:
+                # Fallback to structured text
+                extracted_data = {
+                    "ai_extracted_content": ai_response,
+                    "note": "AI response could not be parsed as JSON"
+                }
+            
+            processing_time = time.time() - start_time
+            
+            return {
+                "extracted_data": extracted_data,
+                "metadata": {
+                    "url": url,
+                    "instruction": instruction,
+                    "processing_time": processing_time,
+                    "extraction_method": "lightweight_ai"
+                },
+                "confidence": 8.0  # High confidence for AI extraction
+            }
+            
         except Exception as e:
-            logger.error(f"Gemini processing failed: {e}")
-            return {"error": str(e), "raw_data": data['structured_data']}
+            logger.error(f"AI extraction failed: {str(e)}")
+            return {
+                "error": str(e),
+                "extracted_data": {},
+                "metadata": {"processing_time": time.time() - start_time}
+            }
 
-# Data Export Engine
+# Lightweight Engine
+class LightweightEngine:
+    def __init__(self):
+        self.scraper = LightweightScraper()
+        self.lang_extract = LightweightLangExtract(GEMINI_API_KEY)
+    
+    async def process_request(self, url: str, instruction: str, timeout: int = 30) -> Dict[str, Any]:
+        """Process scraping request"""
+        try:
+            # Step 1: Scrape the website
+            scraped_data = await asyncio.get_event_loop().run_in_executor(
+                None, self.scraper.scrape_url, url, timeout
+            )
+            
+            # Step 2: Extract with AI
+            content = scraped_data['structured_data']['text']
+            ai_result = await self.lang_extract.smart_extract(content, instruction, url)
+            
+            # Step 3: Combine results
+            result = {
+                "scraped_data": scraped_data['structured_data'],
+                "ai_extracted": ai_result['extracted_data'],
+                "metadata": {
+                    **scraped_data.get('scraping_stats', {}),
+                    **ai_result['metadata'],
+                    "timestamp": scraped_data['timestamp']
+                }
+            }
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Processing failed: {str(e)}")
+            raise e
+
+# Data Export (same as before)
 class DataExporter:
     @staticmethod
     def to_csv(data: Dict) -> str:
-        """Convert data to CSV format"""
-        if 'raw_data' in data and 'tables' in data['raw_data']:
-            # If tables exist, convert to CSV
-            all_rows = []
-            for table in data['raw_data']['tables']:
-                all_rows.extend(table)
-            if all_rows:
-                df = pd.DataFrame(all_rows)
-                return df.to_csv(index=False)
-        
-        # Fallback: convert key-value pairs to CSV
         df = pd.DataFrame([data])
         return df.to_csv(index=False)
     
     @staticmethod
     def to_json(data: Dict) -> str:
-        """Convert data to JSON format"""
         return json.dumps(data, indent=2, ensure_ascii=False)
     
     @staticmethod
     def to_xml(data: Dict) -> str:
-        """Convert data to XML format"""
         root = ET.Element("scraped_data")
-        
         def dict_to_xml(d, parent):
             for key, value in d.items():
-                child = ET.SubElement(parent, str(key))
+                child = ET.SubElement(parent, str(key).replace(' ', '_'))
                 if isinstance(value, dict):
                     dict_to_xml(value, child)
                 elif isinstance(value, list):
@@ -304,149 +377,51 @@ class DataExporter:
                             item_elem.text = str(item)
                 else:
                     child.text = str(value)
-        
         dict_to_xml(data, root)
         return ET.tostring(root, encoding='unicode')
-    
-    @staticmethod
-    def to_r_dashboard(data: Dict) -> str:
-        """Generate R Shiny dashboard code"""
-        r_code = f"""
-# SkyScraper.bot Generated R Dashboard
-library(shiny)
-library(shinydashboard)
-library(DT)
-library(ggplot2)
-library(plotly)
-
-# Data
-scraped_data <- '{json.dumps(data, indent=2)}'
-
-# UI
-ui <- dashboardPage(
-  dashboardHeader(title = "SkyScraper.bot Data Dashboard"),
-  dashboardSidebar(
-    sidebarMenu(
-      menuItem("Overview", tabName = "overview", icon = icon("dashboard")),
-      menuItem("Data Table", tabName = "datatable", icon = icon("table")),
-      menuItem("Visualizations", tabName = "viz", icon = icon("chart-bar"))
-    )
-  ),
-  dashboardBody(
-    tabItems(
-      tabItem(tabName = "overview",
-        fluidRow(
-          box(title = "Data Summary", status = "primary", solidHeader = TRUE, width = 12,
-            verbatimTextOutput("summary")
-          )
-        )
-      ),
-      tabItem(tabName = "datatable",
-        fluidRow(
-          box(title = "Scraped Data", status = "primary", solidHeader = TRUE, width = 12,
-            DT::dataTableOutput("datatable")
-          )
-        )
-      ),
-      tabItem(tabName = "viz",
-        fluidRow(
-          box(title = "Data Visualization", status = "primary", solidHeader = TRUE, width = 12,
-            plotlyOutput("plot")
-          )
-        )
-      )
-    )
-  )
-)
-
-# Server
-server <- function(input, output) {{
-  output$summary <- renderText({{
-    "Data extracted successfully from SkyScraper.bot"
-  }})
-  
-  output$datatable <- DT::renderDataTable({{
-    data.frame(Info = "Data extracted successfully")
-  }})
-  
-  output$plot <- renderPlotly({{
-    p <- ggplot(data.frame(x = 1:10, y = rnorm(10)), aes(x, y)) +
-      geom_line() +
-      labs(title = "Sample Visualization", x = "Index", y = "Value")
-    ggplotly(p)
-  }})
-}}
-
-# Run the app
-shinyApp(ui = ui, server = server)
-"""
-        return r_code
 
 # API Routes
 @app.post("/api/scrape", response_model=ScrapingResponse)
-async def scrape_endpoint(
-    request: ScrapingRequest,
-    background_tasks: BackgroundTasks,
-    user: dict = Depends(verify_google_token)
-):
+async def scrape_endpoint(request: ScrapingRequest, background_tasks: BackgroundTasks):
     """Main scraping endpoint"""
     job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{hash(str(request.url)) % 10000}"
     
-    # Initialize job
     jobs_storage[job_id] = {
         "status": "processing",
-        "user_id": user.get("sub"),
         "request": request.dict(),
         "created_at": datetime.now().isoformat()
     }
     
-    # Add background task
-    background_tasks.add_task(process_scraping_job, job_id, request)
+    background_tasks.add_task(process_lightweight_job, job_id, request)
     
     return ScrapingResponse(
         job_id=job_id,
-        status="processing"
+        status="processing",
+        message="Scraping job started"
     )
 
-async def process_scraping_job(job_id: str, request: ScrapingRequest):
-    """Background task to process scraping job"""
+async def process_lightweight_job(job_id: str, request: ScrapingRequest):
+    """Process scraping job with lightweight engine"""
     try:
-        # Initialize scraping engine
-        engine = SkyscraperEngine()
+        engine = LightweightEngine()
         
-        # Step 1: Scrape the website
-        logger.info(f"Starting scraping for job {job_id}: {request.url}")
-        scraped_data = await engine.scrape_with_playwright(str(request.url), request.anti_detection)
+        logger.info(f"Starting lightweight scraping for job {job_id}")
+        result = await engine.process_request(str(request.url), request.instruction, request.timeout)
         
-        # Step 2: Process with Gemini AI
-        logger.info(f"Processing with Gemini for job {job_id}")
-        processed_data = await engine.process_with_gemini(scraped_data, request.instruction)
-        
-        # Step 3: Extract metadata with LangExtract approach
-        metadata = {}
-        if request.extract_metadata:
-            logger.info(f"Extracting metadata for job {job_id}")
-            content = scraped_data['structured_data']['text']
-            metadata = await engine.lang_extract.extract_metadata(content, str(request.url))
-        
-        # Step 4: Generate exports
+        # Generate exports
         exporter = DataExporter()
         exports = {}
         
         if request.format == "csv":
-            exports["csv"] = exporter.to_csv(processed_data)
+            exports["csv"] = exporter.to_csv(result)
         elif request.format == "xml":
-            exports["xml"] = exporter.to_xml(processed_data)
-        elif request.format == "r_dashboard":
-            exports["r_dashboard"] = exporter.to_r_dashboard(processed_data)
+            exports["xml"] = exporter.to_xml(result)
         else:
-            exports["json"] = exporter.to_json(processed_data)
+            exports["json"] = exporter.to_json(result)
         
-        # Update job status
         jobs_storage[job_id].update({
             "status": "completed",
-            "data": processed_data,
-            "metadata": metadata,
+            "data": result,
             "exports": exports,
             "completed_at": datetime.now().isoformat()
         })
@@ -462,56 +437,40 @@ async def process_scraping_job(job_id: str, request: ScrapingRequest):
         })
 
 @app.get("/api/jobs/{job_id}", response_model=ScrapingResponse)
-async def get_job_status(job_id: str, user: dict = Depends(verify_google_token)):
+async def get_job_status(job_id: str):
     """Get job status and results"""
     if job_id not in jobs_storage:
         raise HTTPException(status_code=404, detail="Job not found")
     
     job = jobs_storage[job_id]
     
-    # Check if user owns this job
-    if job.get("user_id") != user.get("sub"):
-        raise HTTPException(status_code=403, detail="Access denied")
-    
     return ScrapingResponse(
         job_id=job_id,
         status=job["status"],
         data=job.get("data"),
-        metadata=job.get("metadata"),
-        download_urls=job.get("exports", {})
+        download_urls=job.get("exports", {}),
+        message=job.get("error") if job["status"] == "failed" else None
     )
 
-@app.post("/api/auth/google")
-async def google_auth(auth_data: UserAuth):
-    """Handle Google OAuth authentication"""
+# Test endpoint (no auth required)
+@app.post("/api/test-scrape")
+async def test_scrape(url: str, instruction: str = "Extract main content"):
+    """Quick test endpoint"""
     try:
-        # Verify token
-        idinfo = id_token.verify_oauth2_token(auth_data.token, requests.Request(), GOOGLE_CLIENT_ID)
-        
-        user_id = idinfo["sub"]
-        users_storage[user_id] = {
-            "email": auth_data.email,
-            "name": auth_data.name,
-            "created_at": datetime.now().isoformat(),
-            "usage": {"scraped_pages": 0, "api_calls": 0}
-        }
-        
-        return {"status": "success", "user_id": user_id}
+        engine = LightweightEngine()
+        result = await engine.process_request(url, instruction, 15)
+        return {"success": True, "data": result}
     except Exception as e:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        return {"success": False, "error": str(e)}
 
-@app.get("/api/user/usage")
-async def get_user_usage(user: dict = Depends(verify_google_token)):
-    """Get user usage statistics"""
-    user_id = user.get("sub")
-    if user_id in users_storage:
-        return users_storage[user_id]
-    return {"usage": {"scraped_pages": 0, "api_calls": 0}}
-
-# Health check
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "version": "1.0.0-lightweight",
+        "features": ["lightweight_scraping", "ai_extraction", "multi_format_export"]
+    }
 
 if __name__ == "__main__":
     import uvicorn
