@@ -13,10 +13,8 @@ pip install --upgrade pip
 echo "📦 Installing Python dependencies..."
 pip install -r requirements.txt
 
-# Install Playwright browsers
-echo "🕸️ Installing Playwright browsers..."
-pip install playwright
-playwright install chromium
+# Skip Playwright for now - we'll add it later
+echo "⏭️ Skipping Playwright installation for initial deployment..."
 
 # Create necessary directories
 echo "📁 Creating directories..."
